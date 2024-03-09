@@ -64,7 +64,7 @@ variable "controlplane_num" {
 
 variable "controlplane_flavor" {
     description = "The flavor to be used."
-    default  = "12c044f0-842f-48d4-9553-700095cb5153" # a2-ram4-disk0
+    default  = "b6b7baeb-2328-48c9-8543-88cccec8ec4b" # a2-ram4-disk20
 }
 
 variable "controlplane_volume_size" {
@@ -80,7 +80,7 @@ variable "worker_num" {
 
 variable "worker_flavor" {
     description = "The flavor to be used."
-    default  = "12c044f0-842f-48d4-9553-700095cb5153" # a2-ram4-disk0
+    default  = "b6b7baeb-2328-48c9-8543-88cccec8ec4b" # a2-ram4-disk20
 }
 
 variable "worker_volume_size" {
