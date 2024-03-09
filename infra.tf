@@ -125,33 +125,6 @@ resource "openstack_networking_secgroup_rule_v2" "icmp" {
   security_group_id = openstack_networking_secgroup_v2.ssh_internal.id
 }
 
-### MANAGMENT INSTANCE ###
-resource "openstack_compute_instance_v2" "Managment" {
-  depends_on = ["openstack_networking_subnet_v2.private_subnet"]
-  count = var.managment_num
-  name = "managment-${count.index + 1}"
-  image_id = var.managment_image
-  flavor_id = var.managment_flavor
-  key_pair = var.keypair_name
-  security_groups = [openstack_networking_secgroup_v2.ssh_external.name, openstack_networking_secgroup_v2.ssh_internal.name]
-  network {
-    name = "private_network"
-    fixed_ip_v4 = "10.10.0.20${count.index + 1}"    
-  }
-  user_data = file("bootstrap.sh")
-}
-
-resource "openstack_networking_floatingip_v2" "fip" {
-  pool = var.floating_ip_pool
-}
-
-resource "openstack_compute_floatingip_associate_v2" "fip_managment" {
-  depends_on = ["openstack_networking_floatingip_v2.fip"]
-  floating_ip = openstack_networking_floatingip_v2.fip.address
-  instance_id = openstack_compute_instance_v2.Managment[0].id
-}
-
-
 ### CONTROLPLANE INSTANCES ###
 resource "openstack_compute_instance_v2" "Controlplanes" {
   depends_on = ["openstack_networking_subnet_v2.private_subnet","openstack_images_image_v2.talos"]
@@ -214,6 +187,86 @@ resource "openstack_compute_volume_attach_v2" "Workers" {
 }
 
 
+### MANAGMENT INSTANCE ###
+
+resource "openstack_compute_instance_v2" "Managment" {
+  depends_on = [
+    "openstack_networking_subnet_v2.private_subnet",
+    "openstack_compute_instance_v2.Workers",
+    "openstack_compute_instance_v2.Controlplanes"
+  ]
+  count = var.managment_num
+  name = "managment-${count.index + 1}"
+  image_id = var.managment_image
+  flavor_id = var.managment_flavor
+  key_pair = var.keypair_name
+  security_groups = [openstack_networking_secgroup_v2.ssh_external.name, openstack_networking_secgroup_v2.ssh_internal.name]
+  network {
+    name = "private_network"
+    fixed_ip_v4 = "10.10.0.20${count.index + 1}"    
+  }
+  user_data =  <<-EOT
+#!/bin/bash
+echo -e '\n# \e[1;34mInstall made by \e[1;31m@PAPAMICA__ \e[1;34mwith documentation of \e[1;31m@TheBidouilleur \e[0m\n\e[0m
+\e[32m# Documentation (in french) : https://une-tasse-de.cafe/blog/talos/\e[0m\n\e[0m
+\e[32m# Infomaniak Public Cloud documentation : https://docs.infomaniak.cloud/\e[0m\n\e[0m  
+\nControlplanes:
+${join("\n", [for instance in openstack_compute_instance_v2.Controlplanes : "${instance.name} = ${instance.network.0.fixed_ip_v4}"])}
+
+\nWorkers:
+${join("\n", [for instance in openstack_compute_instance_v2.Workers : "${instance.name} = ${instance.network.0.fixed_ip_v4}"])}\n
+\nInstall logs : /var/log/cloud-init-output.log
+' > /etc/motd
+
+cd /home/debian
+
+curl -sL https://talos.dev/install | sh
+
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && rm kubectl
+
+
+sudo wget -qO- https://github.com/derailed/k9s/releases/download/v0.32.3/k9s_Linux_amd64.tar.gz | sudo tar xvz -C /usr/local/bin/
+
+sudo -u debian talosctl gen secrets
+sudo -u debian talosctl gen config mycluster https://10.10.0.11:6443 --with-secrets ./secrets.yaml --install-disk /dev/vda
+
+echo -e "\nWaiting 120 seconds for initial boot"
+sleep 120
+
+${join("\n", [for instance in openstack_compute_instance_v2.Controlplanes : "sudo -u debian talosctl apply-config --insecure -n ${instance.network.0.fixed_ip_v4} -e ${instance.network.0.fixed_ip_v4} --file controlplane.yaml"])}
+${join("\n", [for instance in openstack_compute_instance_v2.Workers : "sudo -u debian talosctl apply-config --insecure -n ${instance.network.0.fixed_ip_v4} -e ${instance.network.0.fixed_ip_v4} --file worker.yaml"])}
+
+sudo -u debian talosctl --talosconfig=./talosconfig config endpoint ${join(" ", openstack_compute_instance_v2.Controlplanes[*].network.0.fixed_ip_v4)}
+sudo -u debian talosctl --talosconfig=./talosconfig config node ${join(" ", openstack_compute_instance_v2.Controlplanes[*].network.0.fixed_ip_v4, openstack_compute_instance_v2.Workers[*].network.0.fixed_ip_v4)}
+sudo -u debian talosctl config merge ./talosconfig
+sleep 120
+sudo -u debian talosctl bootstrap -e 10.10.0.11 --talosconfig ./talosconfig --nodes 10.10.0.11
+sudo -u debian talosctl kubeconfig -e 10.10.0.11 --talosconfig ./talosconfig --nodes 10.10.0.11
+
+# Function to check Kubernetes cluster status
+check_cluster_status() {
+    kubectl get nodes --no-headers=true | awk '$2 != "Ready" {exit 1}' >/dev/null 2>&1
+}
+
+# Wait for the cluster to be ready
+while check_cluster_status; do
+    echo -e "\nThe cluster is not yet ready, waiting...\n"
+    sleep 10
+done
+echo -e "\n#######################################################\n\n         VICTORY ! YOUR K8S CLUSTER IS READY !\n\nYou can use this command to check : kubectl get nodes\n\n#######################################################"
+  EOT
+}
+
+resource "openstack_networking_floatingip_v2" "fip" {
+  pool = var.floating_ip_pool
+}
+
+resource "openstack_compute_floatingip_associate_v2" "fip_managment" {
+  depends_on = ["openstack_networking_floatingip_v2.fip"]
+  floating_ip = openstack_networking_floatingip_v2.fip.address
+  instance_id = openstack_compute_instance_v2.Managment[0].id
+}
 
 
 output "Managment_ip" {
